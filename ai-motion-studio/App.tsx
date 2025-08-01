@@ -17,7 +17,10 @@ const aspectRatios: { id: AspectRatio, name: string }[] = [
     { id: '1:1', name: '1:1' },
 ];
 
-
+/**
+ * Streams video generation progress and results from the server.
+ * Implements exponential backoff for retries to handle transient network issues.
+ */
 const streamVideoGeneration = async (
     prompt: string,
     config: any,
@@ -25,63 +28,82 @@ const streamVideoGeneration = async (
     onResult: (result: VideoResult) => void,
     onError: (error: string) => void
 ) => {
-    const response = await fetch('/api/api', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt, config }),
-    });
+    let retries = 0;
+    const maxRetries = 3;
+    let delay = 1000; // 1 second
 
-    if (!response.body) {
-        onError("Failed to get response stream.");
-        return;
-    }
-    
-    if (!response.ok) {
-        const errorText = await response.text();
+    while (retries < maxRetries) {
         try {
-            const errorJson = JSON.parse(errorText);
-            onError(`Server error: ${errorJson.error || errorText}`);
-        } catch {
-            onError(`Server error: ${response.status} ${response.statusText}. ${errorText}`);
-        }
-        return;
-    }
+            const response = await fetch('/api/api', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ prompt, config }),
+            });
 
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
+            if (!response.body) {
+                onError("Failed to get response stream.");
+                return;
+            }
+            
+            if (!response.ok) {
+                const errorText = await response.text();
+                try {
+                    const errorJson = JSON.parse(errorText);
+                    onError(`Server error: ${response.status} - ${errorJson.error || errorText}`);
+                } catch {
+                    onError(`Server error: ${response.status} ${response.statusText}. ${errorText}`);
+                }
+                return;
+            }
 
-    const processStream = async () => {
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
 
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n\n');
-            buffer = lines.pop() || '';
+            const processStream = async () => {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
 
-            for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                    try {
-                        const json = JSON.parse(line.substring(6));
-                        if (json.type === 'progress') {
-                            onProgress(json.data);
-                        } else if (json.type === 'result') {
-                            onResult(json.data);
-                            return; 
-                        } else if (json.type === 'error') {
-                            onError(json.data);
-                            return;
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n\n');
+                    buffer = lines.pop() || '';
+
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            try {
+                                const json = JSON.parse(line.substring(6));
+                                if (json.type === 'progress') {
+                                    onProgress(json.data);
+                                } else if (json.type === 'result') {
+                                    onResult(json.data);
+                                    return; 
+                                } else if (json.type === 'error') {
+                                    onError(json.data);
+                                    return;
+                                }
+                            } catch (e) {
+                                console.error("Failed to parse stream data:", line, e);
+                            }
                         }
-                    } catch (e) {
-                        console.error("Failed to parse stream data:", line, e);
                     }
                 }
+            };
+
+            await processStream();
+            return; // Exit retry loop on success
+        } catch (e) {
+            console.error(`Attempt ${retries + 1} failed:`, e);
+            retries++;
+            if (retries < maxRetries) {
+                await new Promise(resolve => setTimeout(resolve, delay));
+                delay *= 2; // Exponential backoff
+            } else {
+                onError(`Failed to connect to the server after ${maxRetries} attempts. Please try again later.`);
+                return;
             }
         }
-    };
-
-    await processStream();
+    }
 };
 
 const App: React.FC = () => {
@@ -109,9 +131,9 @@ const App: React.FC = () => {
         setLoading(true);
         setError(null);
         setVideoResult(null);
-        const sceneCount = Math.max(2, Math.ceil(duration / 3));
-        const totalSteps = 2 + sceneCount + (generateNarration ? 1 : 0);
-        setLoadingState({step: 0, totalSteps, message: 'Initializing...'})
+        
+        // Start with an initial loading state, but let the server stream drive the real steps.
+        setLoadingState({step: 0, totalSteps: 1, message: 'Initializing...'})
         
         const config = { 
             duration, 
@@ -148,7 +170,7 @@ const App: React.FC = () => {
 
     const renderContent = () => {
         if (loading && loadingState) {
-            const progress = Math.round((loadingState.step / loadingState.totalSteps) * 100);
+            const progress = loadingState.totalSteps > 0 ? Math.round((loadingState.step / loadingState.totalSteps) * 100) : 0;
             return (
                 <div className="text-center w-full max-w-lg px-4 flex flex-col items-center">
                     <svg xmlns="http://www.w3.org/2000/svg" className="h-20 w-20 text-indigo-400 loader-animate" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1}>
