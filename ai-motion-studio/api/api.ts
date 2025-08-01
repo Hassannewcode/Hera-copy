@@ -1,4 +1,3 @@
-
 import { GoogleGenAI, Type } from '@google/genai';
 import type { LoadingState, VideoResult, AspectRatio } from '../types';
 
@@ -48,16 +47,19 @@ const storyboardSchema = {
                 type: Type.OBJECT,
                 properties: {
                   id: { type: Type.STRING, description: "Unique ID for the element" },
-                  type: { type: Type.STRING, enum: ["text", "shape"] },
+                  // Added 'image' to the enum for new element type
+                  type: { type: Type.STRING, enum: ["text", "shape", "image"] },
                   text: { type: Type.STRING, nullable: true, description: "Text content if type is 'text'" },
                   shape: { type: Type.STRING, enum: ["rectangle", "circle"], nullable: true, description: "Shape type if type is 'shape'"},
+                  // New field for generating a specific image for the element
+                  image_prompt_for_element: { type: Type.STRING, nullable: true, description: "Prompt for an image generator for a specific element. Set to null if type is not 'image'." },
                   keyframes: keyframeSchema
                 },
                 required: ["id", "type", "keyframes"],
               }
             },
             camera_animation: { ...keyframeSchema, nullable: true, description: "Keyframes for the scene's camera movement (pan, zoom, rotate). Can be null." },
-            image_prompt: { type: Type.STRING, description: "Prompt for an image generator. Set to null if no image is needed.", nullable: true },
+            image_prompt: { type: Type.STRING, description: "Prompt for a background image generator. Set to null if no image is needed.", nullable: true },
             background_color: { type: Type.STRING, description: "Background color as a CSS hex code if no image is used." },
           },
           required: ["animationElements", "background_color"],
@@ -75,12 +77,11 @@ Core Principles:
 3.  **Depth & Effects:** Utilize 3D transformations (rotateX/Y, translateZ), filters (blur), text shadows for glows, and opacity for fades.
 4.  **Layout:** Create dynamic layouts. Avoid just centering everything.
 5.  **Camera:** Use camera animations (zoom, pan, rotate) to add energy.
-6.  **Imagery:** If an image is needed, create a detailed, DALL-E 3 style prompt for an abstract, atmospheric background unless the user requests something specific.
+6.  **Imagery:** You can now create two types of images. Use 'image_prompt' for the background. Use 'image_prompt_for_element' for individual animated elements of type 'image'. For both, create a detailed, DALL-E 3 style prompt.
 7.  **Text Color:** The main text elements should use the color specified in the user's prompt.
 `;
 
-
-async function internalGenerateVideo(
+export async function generateVideo(
   prompt: string,
   config: {
     duration: number;
@@ -106,22 +107,19 @@ The primary text color for text elements should be ${config.textColor}.
 
   let storyboardResponseText;
   try {
-     const schemaInstruction = `You MUST respond with a single valid JSON object that strictly adheres to the following JSON schema. Do not add any other text, explanations, or markdown fences like \`\`\`json ... \`\`\` around the response. Just the raw JSON object. Schema: ${JSON.stringify(storyboardSchema)}`;
-     const fullPrompt = `${storyboardPrompt}\n\n${schemaInstruction}`;
+      const schemaInstruction = `You MUST respond with a single valid JSON object that strictly adheres to the following JSON schema. Do not add any other text, explanations, or markdown fences like \`\`\`json ... \`\`\` around the response. Just the raw JSON object. Schema: ${JSON.stringify(storyboardSchema)}`;
+      const fullPrompt = `${storyboardPrompt}\n\n${schemaInstruction}`;
 
-     const response = await ai.models.generateContent({
+      const response = await ai.models.generateContent({
         model: 'gemini-2.5-flash',
         contents: fullPrompt,
         config: {
             systemInstruction: systemInstruction,
             responseMimeType: 'application/json',
-            // Note: responseSchema removed in favor of prompt-based schema enforcement
-            // to improve reliability and avoid potential hangs on complex schemas.
         }
     });
 
     let rawText = response.text.trim();
-    // Defensively clean potential markdown fences, just in case the model ignores the instruction.
     if (rawText.startsWith('```json')) {
         rawText = rawText.substring(7, rawText.length - 3).trim();
     } else if (rawText.startsWith('```')) {
@@ -186,11 +184,12 @@ ${storyboard.map((s: any, i: number) => {
     const sceneSpec = storyboard[i];
     const currentStep = i + imageGenStepStart;
 
+    // Handle background image generation
     if (sceneSpec.image_prompt) {
         onProgress({
             step: currentStep,
             totalSteps,
-            message: `Generating image for scene ${i + 1}/${storyboard.length}...`
+            message: `Generating background image for scene ${i + 1}/${storyboard.length}...`
         });
         
         try {
@@ -206,33 +205,55 @@ ${storyboard.map((s: any, i: number) => {
 
             const base64ImageBytes = imageResponse.generatedImages[0].image.imageBytes;
             scenes.push({
-                animationElements: sceneSpec.animationElements,
-                cameraAnimation: sceneSpec.camera_animation,
+                ...sceneSpec,
                 imageUrl: `data:image/jpeg;base64,${base64ImageBytes}`,
-                backgroundColor: sceneSpec.background_color,
             });
 
         } catch (error) {
             console.error(`Failed to generate image for scene ${i + 1}:`, error);
             scenes.push({
-                animationElements: sceneSpec.animationElements,
-                cameraAnimation: sceneSpec.camera_animation,
-                backgroundColor: sceneSpec.background_color,
+                ...sceneSpec,
+                imageUrl: null, // Fallback to no image
             });
         }
     } else {
-        onProgress({
-            step: currentStep,
-            totalSteps,
-            message: `Processing scene ${i + 1}/${storyboard.length}...`
-        });
         scenes.push({
-            animationElements: sceneSpec.animationElements,
-            cameraAnimation: sceneSpec.camera_animation,
-            backgroundColor: sceneSpec.background_color,
+            ...sceneSpec,
+            imageUrl: null, // No image specified
         });
         await sleep(250);
     }
+  }
+
+  // Handle image generation for individual elements
+  for (const scene of scenes) {
+      for (const element of scene.animationElements) {
+          if (element.type === 'image' && element.image_prompt_for_element) {
+              const imagePrompt = element.image_prompt_for_element;
+              onProgress({
+                  step: totalSteps, // Not a new step, but a sub-task
+                  totalSteps,
+                  message: `Generating image for element "${imagePrompt}"...`
+              });
+              try {
+                  const imageResponse = await ai.models.generateImages({
+                      model: 'imagen-3.0-generate-002',
+                      prompt: `${imagePrompt}, professional motion graphic element, high quality, visually stunning, transparent background`,
+                      config: {
+                          numberOfImages: 1,
+                          outputMimeType: 'image/jpeg', // Jpeg for now, but should ideally be transparent png
+                          aspectRatio: config.aspectRatio,
+                      },
+                  });
+                  const base64ImageBytes = imageResponse.generatedImages[0].image.imageBytes;
+                  element.imageUrl = `data:image/jpeg;base64,${base64ImageBytes}`;
+              } catch (error) {
+                  console.error(`Failed to generate image for element "${imagePrompt}":`, error);
+                  element.imageUrl = null; // Fallback
+              }
+          }
+      }
+      await sleep(250);
   }
 
   onProgress({ step: totalSteps, totalSteps, message: 'Finalizing video...' });
@@ -270,7 +291,7 @@ export default async function handler(req: Request) {
         };
 
         try {
-          const result = await internalGenerateVideo(prompt, config, onProgress);
+          const result = await generateVideo(prompt, config, onProgress);
           controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'result', data: result })}\n\n`));
           controller.close();
         } catch (error) {
