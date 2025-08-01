@@ -1,7 +1,6 @@
 
 import React, { useState, useCallback } from 'react';
 import { LoadingState, VideoResult, AspectRatio } from './types';
-import { generateVideo } from './api/api';
 import { Button } from './components/Button';
 import { VideoPlayer } from './components/VideoPlayer';
 import { QuoteCard } from './components/QuoteCard';
@@ -18,6 +17,73 @@ const aspectRatios: { id: AspectRatio, name: string }[] = [
     { id: '9:16', name: '9:16' },
     { id: '1:1', name: '1:1' },
 ];
+
+
+const streamVideoGeneration = async (
+  prompt: string,
+  config: any,
+  onProgress: (state: LoadingState) => void,
+  onResult: (result: VideoResult) => void,
+  onError: (error: string) => void
+) => {
+  const response = await fetch('/api/api', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt, config }),
+  });
+
+  if (!response.body) {
+    onError("Failed to get response stream.");
+    return;
+  }
+  
+  if (!response.ok) {
+     const errorText = await response.text();
+     try {
+       const errorJson = JSON.parse(errorText);
+       onError(`Server error: ${errorJson.error || errorText}`);
+     } catch {
+       onError(`Server error: ${response.status} ${response.statusText}. ${errorText}`);
+     }
+     return;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  const processStream = async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const json = JSON.parse(line.substring(6));
+              if (json.type === 'progress') {
+                onProgress(json.data);
+              } else if (json.type === 'result') {
+                onResult(json.data);
+                return; 
+              } else if (json.type === 'error') {
+                onError(json.data);
+                return;
+              }
+            } catch (e) {
+              console.error("Failed to parse stream data:", line, e);
+            }
+          }
+        }
+      }
+  };
+
+  await processStream();
+};
 
 const App: React.FC = () => {
   const [prompt, setPrompt] = useState<string>('');
@@ -48,25 +114,30 @@ const App: React.FC = () => {
     const totalSteps = 2 + sceneCount + (generateNarration ? 1 : 0);
     setLoadingState({step: 0, totalSteps, message: 'Initializing...'})
     
-    try {
-      const config = { 
-        duration, 
-        aspectRatio, 
-        generateNarration, 
-        textColor, 
-        transparentBackground,
-        backgroundColor: overrideBg ? bgColor : undefined,
-      };
-      const result = await generateVideo(prompt, config, (state) => {
-          setLoadingState(state);
-      });
-      setVideoResult(result);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoading(false);
-      setLoadingState(null);
-    }
+    const config = { 
+      duration, 
+      aspectRatio, 
+      generateNarration, 
+      textColor, 
+      transparentBackground,
+      backgroundColor: overrideBg ? bgColor : undefined,
+    };
+    
+    await streamVideoGeneration(
+        prompt,
+        config,
+        (state) => setLoadingState(state),
+        (result) => {
+            setVideoResult(result);
+            setLoading(false);
+            setLoadingState(null);
+        },
+        (err) => {
+            setError(err);
+            setLoading(false);
+            setLoadingState(null);
+        }
+    );
   }, [prompt, loading, duration, aspectRatio, generateNarration, textColor, transparentBackground, overrideBg, bgColor]);
   
   const handleTryAgain = () => {
