@@ -1,6 +1,11 @@
 
 import { GoogleGenAI, Type } from '@google/genai';
-import { LoadingState, VideoResult, AspectRatio } from '../types';
+import type { LoadingState, VideoResult, AspectRatio } from '../types';
+
+// This tells Vercel this is an Edge Function
+export const config = {
+  runtime: 'edge',
+};
 
 const DURATION_PER_SCENE = 3;
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -75,7 +80,7 @@ Core Principles:
 `;
 
 
-export const generateVideo = async (
+async function internalGenerateVideo(
   prompt: string,
   config: {
     duration: number;
@@ -86,8 +91,8 @@ export const generateVideo = async (
     backgroundColor?: string;
   },
   onProgress: (state: LoadingState) => void
-): Promise<VideoResult> => {
-  const ai = new GoogleGenAI({apiKey: process.env.API_KEY});
+): Promise<VideoResult> {
+  const ai = new GoogleGenAI({apiKey: process.env.API_KEY!});
   const sceneCount = Math.max(2, Math.ceil(config.duration / DURATION_PER_SCENE));
   const totalSteps = 2 + sceneCount + (config.generateNarration ? 1 : 0);
   
@@ -221,4 +226,54 @@ ${storyboard.map((s: any, i: number) => {
     transparentBackground: config.transparentBackground,
     backgroundColor: config.backgroundColor,
   };
-};
+}
+
+
+// The main function handler for the Vercel serverless function
+export default async function handler(req: Request) {
+  if (req.method !== 'POST') {
+    return new Response(JSON.stringify({ error: 'Method not allowed' }), { status: 405, headers: {'Content-Type': 'application/json'} });
+  }
+
+  try {
+    const { prompt, config } = await req.json();
+    if (!prompt || !config) {
+      return new Response(JSON.stringify({ error: 'Missing prompt or config' }), { status: 400, headers: {'Content-Type': 'application/json'} });
+    }
+
+    const stream = new ReadableStream({
+      async start(controller) {
+        const encoder = new TextEncoder();
+        
+        const onProgress = (state: LoadingState) => {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'progress', data: state })}\n\n`));
+        };
+
+        try {
+          const result = await internalGenerateVideo(prompt, config, onProgress);
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'result', data: result })}\n\n`));
+          controller.close();
+        } catch (error) {
+           const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred during generation.';
+           console.error('Error during video generation:', error);
+           controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', data: errorMessage })}\n\n`));
+           controller.close();
+        }
+      }
+    });
+
+    return new Response(stream, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      },
+    });
+
+  } catch (error) {
+    console.error('Error in handler:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Invalid request body';
+    return new Response(JSON.stringify({ error: errorMessage }), { status: 400, headers: {'Content-Type': 'application/json'} });
+  }
+}
