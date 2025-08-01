@@ -1,6 +1,11 @@
 
 import { GoogleGenAI, Type } from '@google/genai';
-import { LoadingState, VideoResult, AspectRatio } from '../types';
+import type { LoadingState, VideoResult, AspectRatio } from '../types';
+
+// This tells Vercel this is an Edge Function
+export const config = {
+  runtime: 'edge',
+};
 
 const DURATION_PER_SCENE = 3;
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -75,7 +80,7 @@ Core Principles:
 `;
 
 
-export const generateVideo = async (
+async function internalGenerateVideo(
   prompt: string,
   config: {
     duration: number;
@@ -86,8 +91,8 @@ export const generateVideo = async (
     backgroundColor?: string;
   },
   onProgress: (state: LoadingState) => void
-): Promise<VideoResult> => {
-  const ai = new GoogleGenAI({apiKey: process.env.API_KEY});
+): Promise<VideoResult> {
+  const ai = new GoogleGenAI({apiKey: process.env.API_KEY!});
   const sceneCount = Math.max(2, Math.ceil(config.duration / DURATION_PER_SCENE));
   const totalSteps = 2 + sceneCount + (config.generateNarration ? 1 : 0);
   
@@ -101,22 +106,42 @@ The primary text color for text elements should be ${config.textColor}.
 
   let storyboardResponseText;
   try {
+     const schemaInstruction = `You MUST respond with a single valid JSON object that strictly adheres to the following JSON schema. Do not add any other text, explanations, or markdown fences like \`\`\`json ... \`\`\` around the response. Just the raw JSON object. Schema: ${JSON.stringify(storyboardSchema)}`;
+     const fullPrompt = `${storyboardPrompt}\n\n${schemaInstruction}`;
+
      const response = await ai.models.generateContent({
         model: 'gemini-2.5-flash',
-        contents: storyboardPrompt,
+        contents: fullPrompt,
         config: {
             systemInstruction: systemInstruction,
             responseMimeType: 'application/json',
-            responseSchema: storyboardSchema
+            // Note: responseSchema removed in favor of prompt-based schema enforcement
+            // to improve reliability and avoid potential hangs on complex schemas.
         }
     });
-    storyboardResponseText = response.text;
+
+    let rawText = response.text.trim();
+    // Defensively clean potential markdown fences, just in case the model ignores the instruction.
+    if (rawText.startsWith('```json')) {
+        rawText = rawText.substring(7, rawText.length - 3).trim();
+    } else if (rawText.startsWith('```')) {
+        rawText = rawText.substring(3, rawText.length - 3).trim();
+    }
+    storyboardResponseText = rawText;
+
   } catch (e) {
       console.error(e);
       throw new Error(`Failed to generate storyboard. The AI model failed to create an animation plan. Please try rephrasing your prompt.\nDetails: ${(e as Error).message}`);
   }
   
-  const storyboard = JSON.parse(storyboardResponseText).scenes;
+  let storyboard;
+  try {
+    storyboard = JSON.parse(storyboardResponseText).scenes;
+    if (!storyboard) throw new Error("Parsed JSON is missing 'scenes' property.");
+  } catch (e) {
+      console.error("Failed to parse storyboard JSON:", storyboardResponseText);
+      throw new Error(`The AI model returned an invalid response. Please try again.\nDetails: ${(e as Error).message}`);
+  }
 
   let narration;
   if (config.generateNarration) {
@@ -221,4 +246,54 @@ ${storyboard.map((s: any, i: number) => {
     transparentBackground: config.transparentBackground,
     backgroundColor: config.backgroundColor,
   };
-};
+}
+
+
+// The main function handler for the Vercel serverless function
+export default async function handler(req: Request) {
+  if (req.method !== 'POST') {
+    return new Response(JSON.stringify({ error: 'Method not allowed' }), { status: 405, headers: {'Content-Type': 'application/json'} });
+  }
+
+  try {
+    const { prompt, config } = await req.json();
+    if (!prompt || !config) {
+      return new Response(JSON.stringify({ error: 'Missing prompt or config' }), { status: 400, headers: {'Content-Type': 'application/json'} });
+    }
+
+    const stream = new ReadableStream({
+      async start(controller) {
+        const encoder = new TextEncoder();
+        
+        const onProgress = (state: LoadingState) => {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'progress', data: state })}\n\n`));
+        };
+
+        try {
+          const result = await internalGenerateVideo(prompt, config, onProgress);
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'result', data: result })}\n\n`));
+          controller.close();
+        } catch (error) {
+           const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred during generation.';
+           console.error('Error during video generation:', error);
+           controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', data: errorMessage })}\n\n`));
+           controller.close();
+        }
+      }
+    });
+
+    return new Response(stream, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      },
+    });
+
+  } catch (error) {
+    console.error('Error in handler:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Invalid request body';
+    return new Response(JSON.stringify({ error: errorMessage }), { status: 400, headers: {'Content-Type': 'application/json'} });
+  }
+}
