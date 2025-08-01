@@ -1,0 +1,6 @@
+{
+  "name": "AI Motion Studio",
+  "description": "An AI-powered motion designer that turns text prompts into stunning animations.",
+  "requestFramePermissions": [],
+  "prompt": ""
+}
